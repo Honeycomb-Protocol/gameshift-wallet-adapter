@@ -447,6 +447,19 @@ importers:
         specifier: ^0.4.0
         version: 0.4.0
 
+  packages/wallets/gameshift:
+    dependencies:
+      '@solana/wallet-adapter-base':
+        specifier: workspace:^
+        version: link:../../core/base
+    devDependencies:
+      '@solana/web3.js':
+        specifier: ^1.98.2
+        version: 1.98.2(bufferutil@4.0.9)(typescript@5.8.3)(utf-8-validate@5.0.10)
+      shx:
+        specifier: ^0.4.0
+        version: 0.4.0
+
   packages/wallets/huobi:
     dependencies:
       '@solana/wallet-adapter-base':
