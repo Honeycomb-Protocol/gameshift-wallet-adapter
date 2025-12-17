@@ -5,12 +5,18 @@ import {
     WalletNotConnectedError,
     WalletPublicKeyError,
     WalletReadyState,
+    WalletSendTransactionError,
     WalletSignMessageError,
     WalletSignTransactionError,
-    WalletSendTransactionError,
 } from '@solana/wallet-adapter-base';
-import type { Connection, Transaction, TransactionSignature, TransactionVersion, VersionedTransaction } from '@solana/web3.js';
-import { PublicKey } from '@solana/web3.js';
+import type {
+    Connection,
+    Transaction,
+    TransactionSignature,
+    TransactionVersion,
+    VersionedTransaction,
+} from '@solana/web3.js';
+import { PublicKey, VersionedTransaction as VersionedTx } from '@solana/web3.js';
 
 export interface GameshiftWalletAdapterConfig {
     /** The URL of the GameShift portal for wallet connection. Defaults to 'http://localhost:3000' */
@@ -32,6 +38,17 @@ interface GameshiftAuthSuccessData {
 interface GameshiftAuthMessage {
     type: 'gameshift:auth:success' | 'gameshift:auth:error' | 'gameshift:auth:closed';
     data?: GameshiftAuthSuccessData;
+    error?: {
+        code: string;
+        message: string;
+    };
+}
+
+interface GameshiftSignMessage {
+    type: 'gameshift:sign:success' | 'gameshift:sign:error' | 'gameshift:sign:closed';
+    data?: {
+        signedTransaction: string; // hex encoded signed transaction
+    };
     error?: {
         code: string;
         message: string;
@@ -240,20 +257,125 @@ export class GameshiftWalletAdapter extends BaseMessageSignerWalletAdapter {
         try {
             if (!this._publicKey) throw new WalletNotConnectedError();
 
-            // TODO: Implement actual transaction signing via GameShift portal popup
-            throw new WalletSignTransactionError('signTransaction is not yet implemented for GameShift wallet');
+            const signedTransaction = await this._openSignPopup(transaction);
+            return signedTransaction as T;
         } catch (error: any) {
             this.emit('error', error);
             throw error;
         }
     }
 
+    private async _openSignPopup<T extends Transaction | VersionedTransaction>(transaction: T): Promise<T> {
+        if (transaction instanceof VersionedTx) {
+            throw new WalletSignTransactionError('Versioned transactions are not yet supported for signing');
+        }
+
+        return new Promise<T>((resolve, reject) => {
+            let isResolved = false;
+
+            // Serialize the transaction to hex
+            const serializedTransaction = Buffer.from(transaction.serialize({ requireAllSignatures: false })).toString(
+                'hex'
+            );
+            console.log('Serialized Transaction (hex):', serializedTransaction);
+
+            // Calculate popup position (centered)
+            const left = window.screenX + (window.outerWidth - this._popupWidth) / 2;
+            const top = window.screenY + (window.outerHeight - this._popupHeight) / 2;
+
+            // Build popup URL
+            const origin = window.location.origin;
+            const popupUrl = `${this._portalUrl}/auth/sign-transaction?origin=${encodeURIComponent(origin)}&serializedTransaction=${encodeURIComponent(serializedTransaction)}`;
+
+            // Message handler for postMessage from popup
+            this._messageHandler = (event: MessageEvent) => {
+                // Only accept messages from the portal
+                if (event.origin !== this._portalUrl) return;
+
+                const message = event.data as GameshiftSignMessage;
+
+                switch (message.type) {
+                    case 'gameshift:sign:success':
+                        if (message.data && !isResolved) {
+                            isResolved = true;
+                            this._cleanup();
+
+                            // Deserialize the signed transaction from hex
+                            const signedBytes = Buffer.from(message.data.signedTransaction, 'hex');
+                            const isVersioned = 'version' in transaction;
+
+                            if (isVersioned) {
+                                resolve(VersionedTx.deserialize(signedBytes) as T);
+                            } else {
+                                const { Transaction: LegacyTransaction } = require('@solana/web3.js');
+                                resolve(LegacyTransaction.from(signedBytes) as T);
+                            }
+                        }
+                        break;
+
+                    case 'gameshift:sign:error':
+                        if (!isResolved) {
+                            isResolved = true;
+                            this._cleanup();
+                            reject(
+                                new WalletSignTransactionError(message.error?.message || 'Transaction signing failed')
+                            );
+                        }
+                        break;
+
+                    case 'gameshift:sign:closed':
+                        // Ignore - user closing popup is handled by polling
+                        break;
+                }
+            };
+
+            window.addEventListener('message', this._messageHandler);
+
+            // Open popup
+            this._popup = window.open(
+                popupUrl,
+                'gameshift-sign-transaction',
+                `width=${this._popupWidth},height=${this._popupHeight},left=${left},top=${top},popup=1,scrollbars=yes`
+            );
+
+            if (!this._popup) {
+                this._cleanup();
+                reject(new WalletSignTransactionError('Failed to open popup - it may be blocked by the browser'));
+                return;
+            }
+
+            // Poll for popup being closed by user
+            let closedCheckCount = 0;
+            this._popupCheckInterval = setInterval(() => {
+                try {
+                    if (this._popup?.closed) {
+                        closedCheckCount++;
+                        if (closedCheckCount >= 3 && !isResolved) {
+                            isResolved = true;
+                            this._cleanup();
+                            reject(new WalletSignTransactionError('User closed the signing popup'));
+                        }
+                    } else {
+                        closedCheckCount = 0;
+                    }
+                } catch {
+                    // Ignore errors accessing cross-origin popup
+                }
+            }, 500);
+        });
+    }
+
     async signAllTransactions<T extends Transaction | VersionedTransaction>(transactions: T[]): Promise<T[]> {
         try {
             if (!this._publicKey) throw new WalletNotConnectedError();
 
-            // TODO: Implement actual batch transaction signing via GameShift portal popup
-            throw new WalletSignTransactionError('signAllTransactions is not yet implemented for GameShift wallet');
+            // Sign transactions one by one
+            const signedTransactions: T[] = [];
+            for (const transaction of transactions) {
+                const signed = await this._openSignPopup(transaction);
+                signedTransactions.push(signed);
+            }
+            return signedTransactions;
         } catch (error: any) {
             this.emit('error', error);
             throw error;
