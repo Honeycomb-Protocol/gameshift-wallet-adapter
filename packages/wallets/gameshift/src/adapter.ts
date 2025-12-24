@@ -5,9 +5,6 @@ import {
     WalletNotConnectedError,
     WalletPublicKeyError,
     WalletReadyState,
-    WalletSendTransactionError,
-    WalletSignMessageError,
-    WalletSignTransactionError,
 } from '@solana/wallet-adapter-base';
 import type {
     Connection,
@@ -16,9 +13,12 @@ import type {
     TransactionVersion,
     VersionedTransaction,
 } from '@solana/web3.js';
-import { PublicKey, VersionedTransaction as VersionedTx } from '@solana/web3.js';
+import { PublicKey } from '@solana/web3.js';
+import { MetaKeep } from 'metakeep';
 
 export interface GameshiftWalletAdapterConfig {
+    /** MetaKeep App ID for transaction signing (required) */
+    metakeepAppId: string;
     /** The URL of the GameShift portal for wallet connection. Defaults to 'http://localhost:3000' */
     portalUrl?: string;
     /** Popup window width. Defaults to 450 */
@@ -65,7 +65,9 @@ export class GameshiftWalletAdapter extends BaseMessageSignerWalletAdapter {
     private _connecting: boolean;
     private _publicKey: PublicKey | null;
     private _token: string | null;
+    private _email: string | null;
     private _portalUrl: string;
+    private _metakeepAppId: string;
     private _popupWidth: number;
     private _popupHeight: number;
     private _popup: Window | null;
@@ -76,12 +78,14 @@ export class GameshiftWalletAdapter extends BaseMessageSignerWalletAdapter {
             ? WalletReadyState.Unsupported
             : WalletReadyState.Loadable;
 
-    constructor(config: GameshiftWalletAdapterConfig = {}) {
+    constructor(config: GameshiftWalletAdapterConfig) {
         super();
         this._connecting = false;
         this._publicKey = null;
         this._token = null;
+        this._email = null;
         this._portalUrl = config.portalUrl || 'http://localhost:3000';
+        this._metakeepAppId = config.metakeepAppId;
         this._popupWidth = config.popupWidth || 450;
         this._popupHeight = config.popupHeight || 650;
         this._popup = null;
@@ -107,6 +111,13 @@ export class GameshiftWalletAdapter extends BaseMessageSignerWalletAdapter {
      */
     get token(): string | null {
         return this._token;
+    }
+
+    /**
+     * Get the user's email address after connection.
+     */
+    get email(): string | null {
+        return this._email;
     }
 
     async connect(): Promise<void> {
@@ -215,6 +226,24 @@ export class GameshiftWalletAdapter extends BaseMessageSignerWalletAdapter {
             this._publicKey = parsedPublicKey;
             this._token = token;
 
+            // Exchange token for user info (email)
+            try {
+                const response = await fetch(`${this._portalUrl}/api/auth/wallet/exchange`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ token }),
+                });
+
+                if (response.ok) {
+                    const data = await response.json();
+                    this._email = data.user?.email || null;
+                }
+            } catch {
+                // Silently fail - email is optional for connection
+            }
+
             this.emit('connect', parsedPublicKey);
         } catch (error: any) {
             this.emit('error', error);
@@ -231,6 +260,7 @@ export class GameshiftWalletAdapter extends BaseMessageSignerWalletAdapter {
 
         this._publicKey = null;
         this._token = null;
+        this._email = null;
 
         if (wasConnected) {
             this.emit('disconnect');
@@ -244,9 +274,8 @@ export class GameshiftWalletAdapter extends BaseMessageSignerWalletAdapter {
     ): Promise<TransactionSignature> {
         try {
             if (!this._publicKey) throw new WalletNotConnectedError();
-
-            // TODO: Implement actual transaction sending via GameShift portal
-            throw new WalletSendTransactionError('sendTransaction is not yet implemented for GameShift wallet');
+            transaction = await this.signTransaction(transaction);
+            return connection.sendRawTransaction(transaction.serialize(), options);
         } catch (error: any) {
             this.emit('error', error);
             throw error;
@@ -256,124 +285,50 @@ export class GameshiftWalletAdapter extends BaseMessageSignerWalletAdapter {
     async signTransaction<T extends Transaction | VersionedTransaction>(transaction: T): Promise<T> {
         try {
             if (!this._publicKey) throw new WalletNotConnectedError();
+            if (!this._email) throw new WalletNotConnectedError('User email not available');
 
-            const signedTransaction = await this._openSignPopup(transaction);
-            return signedTransaction as T;
+            const sdk = new MetaKeep({
+                appId: this._metakeepAppId,
+                user: { email: this._email },
+            });
+
+            const signature = await sdk.signTransaction(transaction, 'Signing transaction using GameShift Wallet');
+            transaction.addSignature(this._publicKey, Buffer.from(signature.signature.slice(2), 'hex'));
+
+            return transaction;
         } catch (error: any) {
             this.emit('error', error);
             throw error;
         }
     }
 
-    private async _openSignPopup<T extends Transaction | VersionedTransaction>(transaction: T): Promise<T> {
-        if (transaction instanceof VersionedTx) {
-            throw new WalletSignTransactionError('Versioned transactions are not yet supported for signing');
-        }
-
-        return new Promise<T>((resolve, reject) => {
-            let isResolved = false;
-
-            // Serialize the transaction to hex
-            const serializedTransaction = Buffer.from(transaction.serialize({ requireAllSignatures: false })).toString(
-                'hex'
-            );
-            console.log('Serialized Transaction (hex):', serializedTransaction);
-
-            // Calculate popup position (centered)
-            const left = window.screenX + (window.outerWidth - this._popupWidth) / 2;
-            const top = window.screenY + (window.outerHeight - this._popupHeight) / 2;
-
-            // Build popup URL
-            const origin = window.location.origin;
-            const popupUrl = `${this._portalUrl}/auth/sign-transaction?origin=${encodeURIComponent(origin)}&serializedTransaction=${encodeURIComponent(serializedTransaction)}`;
-
-            // Message handler for postMessage from popup
-            this._messageHandler = (event: MessageEvent) => {
-                // Only accept messages from the portal
-                if (event.origin !== this._portalUrl) return;
-
-                const message = event.data as GameshiftSignMessage;
-
-                switch (message.type) {
-                    case 'gameshift:sign:success':
-                        if (message.data && !isResolved) {
-                            isResolved = true;
-                            this._cleanup();
-
-                            // Deserialize the signed transaction from hex
-                            const signedBytes = Buffer.from(message.data.signedTransaction, 'hex');
-                            const isVersioned = 'version' in transaction;
-
-                            if (isVersioned) {
-                                resolve(VersionedTx.deserialize(signedBytes) as T);
-                            } else {
-                                const { Transaction: LegacyTransaction } = require('@solana/web3.js');
-                                resolve(LegacyTransaction.from(signedBytes) as T);
-                            }
-                        }
-                        break;
-
-                    case 'gameshift:sign:error':
-                        if (!isResolved) {
-                            isResolved = true;
-                            this._cleanup();
-                            reject(
-                                new WalletSignTransactionError(message.error?.message || 'Transaction signing failed')
-                            );
-                        }
-                        break;
-
-                    case 'gameshift:sign:closed':
-                        // Ignore - user closing popup is handled by polling
-                        break;
-                }
-            };
-
-            window.addEventListener('message', this._messageHandler);
-
-            // Open popup
-            this._popup = window.open(
-                popupUrl,
-                'gameshift-sign-transaction',
-                `width=${this._popupWidth},height=${this._popupHeight},left=${left},top=${top},popup=1,scrollbars=yes`
-            );
-
-            if (!this._popup) {
-                this._cleanup();
-                reject(new WalletSignTransactionError('Failed to open popup - it may be blocked by the browser'));
-                return;
-            }
-
-            // Poll for popup being closed by user
-            let closedCheckCount = 0;
-            this._popupCheckInterval = setInterval(() => {
-                try {
-                    if (this._popup?.closed) {
-                        closedCheckCount++;
-                        if (closedCheckCount >= 3 && !isResolved) {
-                            isResolved = true;
-                            this._cleanup();
-                            reject(new WalletSignTransactionError('User closed the signing popup'));
-                        }
-                    } else {
-                        closedCheckCount = 0;
-                    }
-                } catch {
-                    // Ignore errors accessing cross-origin popup
-                }
-            }, 500);
-        });
-    }
-
     async signAllTransactions<T extends Transaction | VersionedTransaction>(transactions: T[]): Promise<T[]> {
         try {
             if (!this._publicKey) throw new WalletNotConnectedError();
+            if (!this._email) throw new WalletNotConnectedError('User email not available');
+
+            const sdk = new MetaKeep({
+                appId: this._metakeepAppId,
+                user: { email: this._email },
+            });
+
+            const { signatures }: { status: 'SUCCESS'; signatures: { signature: string }[] } =
+                await sdk.signTransactionMultiple(
+                    transactions.map((t) => ({
+                        transactionObject: t,
+                        reason: 'Signing transaction using GameShift Wallet',
+                    })),
+                    'Signing multiple transactions using GameShift Wallet'
+                );
 
             // Sign transactions one by one
             const signedTransactions: T[] = [];
             for (const transaction of transactions) {
-                const signed = await this._openSignPopup(transaction);
-                signedTransactions.push(signed);
+                transaction.addSignature(
+                    this._publicKey,
+                    Buffer.from(signatures[signedTransactions.length].signature.slice(2), 'hex')
+                );
+                signedTransactions.push(transaction);
             }
             return signedTransactions;
         } catch (error: any) {
@@ -385,9 +340,19 @@ export class GameshiftWalletAdapter extends BaseMessageSignerWalletAdapter {
     async signMessage(message: Uint8Array): Promise<Uint8Array> {
         try {
             if (!this._publicKey) throw new WalletNotConnectedError();
+            if (!this._email) throw new WalletNotConnectedError('User email not available');
 
-            // TODO: Implement actual message signing via GameShift portal popup
-            throw new WalletSignMessageError('signMessage is not yet implemented for GameShift wallet');
+            const sdk = new MetaKeep({
+                appId: this._metakeepAppId,
+                user: { email: this._email },
+            });
+
+            const { signature }: { status: 'SUCCESS'; signature: string } = await sdk.signMessage(
+                Buffer.from(message).toString(),
+                'Signing message using GameShift Wallet'
+            );
+
+            return Buffer.from(signature.slice(2), 'hex');
         } catch (error: any) {
             this.emit('error', error);
             throw error;
