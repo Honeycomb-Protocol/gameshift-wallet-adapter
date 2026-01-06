@@ -1,6 +1,7 @@
 import type { SendTransactionOptions, WalletName } from '@solana/wallet-adapter-base';
 import {
     BaseMessageSignerWalletAdapter,
+    scopePollingDetectionStrategy,
     WalletConnectionError,
     WalletNotConnectedError,
     WalletPublicKeyError,
@@ -73,10 +74,7 @@ export class GameshiftWalletAdapter extends BaseMessageSignerWalletAdapter {
     private _popup: Window | null;
     private _messageHandler: ((event: MessageEvent) => void) | null;
     private _popupCheckInterval: ReturnType<typeof setInterval> | null;
-    private _readyState: WalletReadyState =
-        typeof window === 'undefined' || typeof document === 'undefined'
-            ? WalletReadyState.Unsupported
-            : WalletReadyState.Loadable;
+    private _readyState: WalletReadyState = WalletReadyState.Loadable;
 
     constructor(config: GameshiftWalletAdapterConfig) {
         super();
@@ -84,13 +82,20 @@ export class GameshiftWalletAdapter extends BaseMessageSignerWalletAdapter {
         this._publicKey = null;
         this._token = null;
         this._email = null;
-        this._portalUrl = config.portalUrl || 'http://localhost:3000';
+        // Normalize portal URL: remove trailing slash and ensure www prefix for consistency
+        this._portalUrl = this._normalizePortalUrl(config.portalUrl || 'http://localhost:3000');
         this._metakeepAppId = config.metakeepAppId;
         this._popupWidth = config.popupWidth || 450;
         this._popupHeight = config.popupHeight || 650;
         this._popup = null;
         this._messageHandler = null;
         this._popupCheckInterval = null;
+
+        scopePollingDetectionStrategy(() => {
+            this._readyState = WalletReadyState.Installed;
+            this.emit('readyStateChange', this._readyState);
+            return true;
+        });
     }
 
     get publicKey() {
@@ -120,6 +125,14 @@ export class GameshiftWalletAdapter extends BaseMessageSignerWalletAdapter {
         return this._email;
     }
 
+    async autoConnect(): Promise<void> {
+        // Skip autoconnect in the Loadable state
+        // We can't redirect to a universal link without user input
+        if (this.readyState === WalletReadyState.Installed) {
+            await this.connect();
+        }
+    }
+
     async connect(): Promise<void> {
         try {
             if (this.connected || this.connecting) return;
@@ -145,10 +158,12 @@ export class GameshiftWalletAdapter extends BaseMessageSignerWalletAdapter {
                 // Message handler for postMessage from popup
                 this._messageHandler = (event: MessageEvent) => {
                     // Only accept messages from the portal
-                    if (event.origin !== this._portalUrl) return;
+                    if (event.origin !== this._portalUrl) {
+                        console.log('Origin mismatch, ignoring message');
+                        return;
+                    }
 
                     const message = event.data as GameshiftAuthMessage;
-
                     switch (message.type) {
                         case 'gameshift:auth:success':
                             if (message.data && !isResolved) {
@@ -201,6 +216,7 @@ export class GameshiftWalletAdapter extends BaseMessageSignerWalletAdapter {
                             // Wait for 3 consecutive checks (1.5s) to confirm it's really closed
                             // This allows OAuth redirects time to complete
                             if (closedCheckCount >= 3 && !isResolved) {
+                                debugger;
                                 isResolved = true;
                                 this._cleanup();
                                 reject(new WalletConnectionError('User closed the authentication popup'));
@@ -357,6 +373,25 @@ export class GameshiftWalletAdapter extends BaseMessageSignerWalletAdapter {
             this.emit('error', error);
             throw error;
         }
+    }
+
+    private _normalizePortalUrl(url: string): string {
+        // Remove trailing slash
+        url = url.replace(/\/$/, '');
+
+        // For non-localhost URLs, ensure www prefix if the portal uses it
+        try {
+            const parsed = new URL(url);
+            if (parsed.hostname !== 'localhost' && !parsed.hostname.startsWith('www.')) {
+                // Add www prefix for production domains (e.g., gameshift.gg -> www.gameshift.gg)
+                parsed.hostname = `www.${parsed.hostname}`;
+                return parsed.toString().replace(/\/$/, '');
+            }
+        } catch {
+            // If URL parsing fails, return as-is
+        }
+
+        return url;
     }
 
     private _cleanup(): void {

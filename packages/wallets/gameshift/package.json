@@ -1,6 +1,6 @@
 {
-    "name": "@solana/wallet-adapter-gameshift",
-    "version": "0.1.0",
+    "name": "wallet-adapter-gameshift",
+    "version": "0.1.2",
     "author": "GameShift",
     "repository": "https://github.com/anza-xyz/wallet-adapter",
     "license": "Apache-2.0",
